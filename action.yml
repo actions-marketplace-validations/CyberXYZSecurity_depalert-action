@@ -7,8 +7,21 @@
 #     with:
 #       api-key: ${{ secrets.XYZ_API_KEY }}
 #
+# mode: scan (default) checks the lockfiles and gates the build. It also runs
+# the offline `xyz code-scan ci` (.github: known-compromised actions, unpinned
+# actions anyone can trigger, script injection ...) and `xyz code-scan agents`
+# (Claude Code / Gemini hooks, VS Code folderOpen tasks and agent rules that run
+# code when the repository is opened). ci fails only on critical (a
+# known-compromised action) and agents on high, so existing v1 users are not
+# broken by findings their workflows already had; everything else is printed.
+# Thresholds: ci-fail-on, agents-fail-on. code-scan: "false" turns both off.
+# A future v2 will default ci-fail-on to high.
+# mode: protect routes the job's own npm / pip / uv / yarn / go / NuGet
+# installs through the CyberXYZ proxy; put it before your install steps and
+# keep a scan step after them.
+#
 name: "CyberXYZ DepAlert"
-description: "Fail the build on malicious or quarantined dependencies, checked against the CyberXYZ decision engine."
+description: "Route CI installs through the CyberXYZ proxy and fail the build on malicious or quarantined dependencies."
 author: "CyberXYZ Security"
 branding:
   icon: "shield"
@@ -18,6 +31,22 @@ inputs:
   api-key:
     description: "CyberXYZ API key (sk_xyz_...). Store it as a repository secret."
     required: true
+  mode:
+    description: "scan: check the manifests and gate the build (default). protect: route every later install step in this job through the CyberXYZ proxy; run it before installs."
+    required: false
+    default: "scan"
+  network-lock:
+    description: "protect mode: also blackhole the public registries (registry.npmjs.org, pypi.org, proxy.golang.org, api.nuget.org, ...) in /etc/hosts so nothing can bypass the proxy. Linux/macOS runners with sudo only."
+    required: false
+    default: "false"
+  strict:
+    description: "protect mode: fail the step when the proxy could not be configured. Default false: the job continues unprotected with a warning."
+    required: false
+    default: "false"
+  cli-version:
+    description: "cyberxyz-scanner to install: a pip version range (default: the newest 1.4.x release, at least 1.4.66), an exact version such as 1.4.70 for reproducible runs, or 'latest'."
+    required: false
+    default: ">=1.4.66,<1.5"
   fail-on:
     description: "Narrowest verdict that fails the build: block | quarantine | alert"
     required: false
@@ -35,31 +64,111 @@ inputs:
     required: false
     default: "3.11"
   working-directory:
-    description: "Directory to scan when manifests are auto-detected"
+    description: "Directory to scan when manifests are auto-detected, and the repository root for code-scan"
     required: false
     default: "."
+  code-scan:
+    description: "scan mode: also run the offline `xyz code-scan ci` (on .github) and `xyz code-scan agents` checks. true (default) or false."
+    required: false
+    default: "true"
+  ci-fail-on:
+    description: "Lowest `xyz code-scan ci` severity that fails the build: critical (default in v1: a known-compromised action) | high | medium | low | none. Lower findings are printed. A future v2 will default this to high."
+    required: false
+    default: "critical"
+  agents-fail-on:
+    description: "Lowest `xyz code-scan agents` severity that fails the build: critical | high (default) | medium | low | none. Medium findings (a hook that runs a repo script, with no other sign of a worm drop) are printed either way."
+    required: false
+    default: "high"
+
 
 outputs:
   verdict:
-    description: "Worst verdict seen: allow | alert | quarantine | block | error. Also exported as env XYZ_VERDICT for later steps."
+    description: "scan mode: worst verdict seen: allow | alert | quarantine | block | error. Also exported as env XYZ_VERDICT for later steps. Empty in protect mode."
     value: ${{ steps.scan.outputs.verdict }}
   exit-code:
     description: "0 clean, 1 block, 2 quarantine, 3 alert, 4 backend unreachable"
     value: ${{ steps.scan.outputs.exit }}
+  code-scan-exit:
+    description: "code-scan ci + agents: 0 nothing at or above ci-fail-on / agents-fail-on, 1 findings, 2+ could not run. Empty when code-scan is off."
+    value: ${{ steps.codescan.outputs.exit }}
+
 
 runs:
   using: "composite"
   steps:
     # No pip cache: setup-python's cache needs a requirements/pyproject file in
     # the consumer's repo and hard-fails without one (npm-only or Go-only repos).
-    - uses: actions/setup-python@v5
+    - name: check mode
+      shell: bash
+      env:
+        MODE: ${{ inputs.mode }}
+      run: |
+        case "$MODE" in
+          scan|protect) ;;
+          *) echo "::error title=CyberXYZ DepAlert::mode must be scan or protect, got '$MODE'"; exit 1 ;;
+        esac
+
+    # ── mode: protect ────────────────────────────────────────────────────
+    # No setup-python here: it would put a different Python first on PATH for
+    # every later step of the consumer's job. The CLI goes into its own venv
+    # built from whatever python the runner already has.
+    - id: protect
+      if: inputs.mode == 'protect'
+      shell: bash
+      env:
+        XYZ_API_KEY: ${{ inputs.api-key }}
+        XYZ_API_URL: ${{ inputs.api-url }}
+        CLI_VERSION: ${{ inputs.cli-version }}
+        NETWORK_LOCK: ${{ inputs.network-lock }}
+        STRICT: ${{ inputs.strict }}
+      run: |
+        set +e
+        warn () {
+          echo "::warning title=CyberXYZ protect::$1; installs in this job are NOT routed through CyberXYZ"
+          if [ "$STRICT" = "true" ]; then exit 1; fi
+          exit 0
+        }
+        PY="$(command -v python3 || command -v python)"
+        [ -n "$PY" ] || warn "no python on the runner to run the CLI"
+        venv="${RUNNER_TEMP:-/tmp}/cyberxyz-cli"
+        "$PY" -m venv "$venv" >/dev/null || warn "could not create a venv for the CLI"
+        bin="$venv/bin"; [ -d "$bin" ] || bin="$venv/Scripts"
+        # "" / latest: newest release. 1.4.70: exactly that. >=1.4.66,<1.5 (or
+        # any PEP 440 specifier): the newest release in the range.
+        case "$CLI_VERSION" in
+          ""|latest) spec="cyberxyz-scanner" ;;
+          [0-9]*)    spec="cyberxyz-scanner==$CLI_VERSION" ;;
+          *)         spec="cyberxyz-scanner$CLI_VERSION" ;;
+        esac
+        "$bin/python" -m pip install --quiet --disable-pip-version-check "$spec" || warn "could not install $spec"
+        args="--format github"
+        [ "$NETWORK_LOCK" = "true" ] && args="$args --network-lock"
+        [ "$STRICT" = "true" ] && args="$args --strict"
+        # xyz ci protect exits 0 on its own failures unless --strict; a
+        # non-zero exit here means the CLI is too old to have the command.
+        "$bin/xyz" ci protect $args || { rc=$?; [ "$STRICT" = "true" ] && exit $rc; warn "xyz ci protect failed (exit $rc)"; }
+
+    # ── mode: scan ───────────────────────────────────────────────────────
+    - if: inputs.mode == 'scan'
+      uses: actions/setup-python@v5
       with:
         python-version: ${{ inputs.python-version }}
 
-    - shell: bash
-      run: pip install --quiet cyberxyz-scanner
+    - if: inputs.mode == 'scan'
+      shell: bash
+      env:
+        CLI_VERSION: ${{ inputs.cli-version }}
+      run: |
+        case "$CLI_VERSION" in
+          ""|latest) spec="cyberxyz-scanner" ;;
+          [0-9]*)    spec="cyberxyz-scanner==$CLI_VERSION" ;;
+          *)         spec="cyberxyz-scanner$CLI_VERSION" ;;
+        esac
+        pip install --quiet "$spec"
+        xyz --version || true
 
     - id: scan
+      if: inputs.mode == 'scan'
       shell: bash
       env:
         XYZ_API_KEY: ${{ inputs.api-key }}
@@ -75,11 +184,14 @@ runs:
         set +e
         set -u
         worst=0
+        # Exit codes are not ordered by severity (1 block, 2 quarantine,
+        # 3 alert, 4+ error), so compare ranks, not raw codes.
+        rank () { case "$1" in 0) echo 0 ;; 3) echo 1 ;; 1) echo 4 ;; 2) echo 3 ;; *) echo 2 ;; esac; }
         run_scan () {  # $1 flag, $2 path
           echo "::group::xyz depalert scan $2"
           if xyz depalert scan "$1" "$2" --fail-on "$FAIL_ON"; then rc=0; else rc=$?; fi
           echo "::endgroup::"
-          if [ "$rc" -gt "$worst" ]; then worst=$rc; fi
+          if [ "$(rank "$rc")" -gt "$(rank "$worst")" ]; then worst=$rc; fi
           return 0
         }
         cd "$WORKDIR" || { echo "::error::working-directory '$WORKDIR' not found"; echo "verdict=error" >> "$GITHUB_OUTPUT"; echo "exit=4" >> "$GITHUB_OUTPUT"; exit 0; }
@@ -88,7 +200,11 @@ runs:
             case "$f" in
               *package-lock.json) run_scan --package-lock "$f" ;;
               *go.sum)            run_scan --go-sum "$f" ;;
-              *)                  run_scan --requirements "$f" ;;
+              *requirements*.txt|*Pipfile.lock|*poetry.lock|*uv.lock)
+                                  run_scan --requirements "$f" ;;
+              # Not parsed yet: warn instead of failing the job (the scanner
+              # now refuses a non-empty manifest it cannot read).
+              *)                  echo "::warning title=CyberXYZ DepAlert::$f is not a supported manifest yet, skipped" ;;
             esac
           done
         else
@@ -108,9 +224,52 @@ runs:
         echo "XYZ_VERDICT=$v" >> "$GITHUB_ENV"
         echo "### CyberXYZ DepAlert: **$v**" >> "$GITHUB_STEP_SUMMARY"
 
+    # Offline checks of what GitHub runs (.github) and of what AI agents and
+    # editors run when the repository is opened. Never fails itself; the
+    # code-scan gate below does. Findings are printed in full, so medium ones
+    # show in the log without failing the build.
+    - id: codescan
+      if: inputs.mode == 'scan' && inputs.code-scan == 'true'
+      shell: bash
+      env:
+        WORKDIR: ${{ inputs.working-directory }}
+        CI_FAIL_ON: ${{ inputs.ci-fail-on }}
+        AGENTS_FAIL_ON: ${{ inputs.agents-fail-on }}
+      run: |
+        set +e
+        worst=0
+        cd "$WORKDIR" || { echo "::error::working-directory '$WORKDIR' not found"; echo "exit=4" >> "$GITHUB_OUTPUT"; exit 0; }
+        run_cs () {  # $1 scanner, $2 target, $3 threshold
+          if ! xyz code-scan "$1" --help >/dev/null 2>&1; then
+            echo "::warning title=CyberXYZ code-scan::xyz code-scan $1 needs a newer cyberxyz-scanner (cli-version), skipped"
+            return 0
+          fi
+          echo "xyz code-scan $1 $2 --fail-on $3"
+          xyz code-scan "$1" "$2" --no-upload --fail-on "$3"
+          rc=$?
+          if [ "$rc" -gt "$worst" ]; then worst=$rc; fi
+        }
+        if [ -d .github ]; then run_cs ci .github "$CI_FAIL_ON"; fi
+        run_cs agents . "$AGENTS_FAIL_ON"
+        echo "exit=$worst" >> "$GITHUB_OUTPUT"
+        if [ "$worst" = 0 ]; then r="nothing at or above ci $CI_FAIL_ON / agents $AGENTS_FAIL_ON"; else r="exit $worst, see the log"; fi
+        echo "### CyberXYZ code-scan (ci, agents): $r" >> "$GITHUB_STEP_SUMMARY"
+
     - name: gate
-      if: steps.scan.outputs.exit != '0'
+      # mode guard: when scan is skipped its outputs are empty, and '' != '0'.
+      if: inputs.mode == 'scan' && steps.scan.outputs.exit != '0'
       shell: bash
       run: |
         echo "::error title=CyberXYZ DepAlert::verdict ${{ steps.scan.outputs.verdict }} (exit ${{ steps.scan.outputs.exit }}), see the scan output above"
         exit ${{ steps.scan.outputs.exit }}
+
+    - name: code-scan gate
+      if: inputs.mode == 'scan' && inputs.code-scan == 'true' && steps.codescan.outputs.exit != '0'
+      shell: bash
+      env:
+        CI_FAIL_ON: ${{ inputs.ci-fail-on }}
+        AGENTS_FAIL_ON: ${{ inputs.agents-fail-on }}
+        CODE_EXIT: ${{ steps.codescan.outputs.exit }}
+      run: |
+        echo "::error title=CyberXYZ code-scan::findings at or above ci-fail-on ($CI_FAIL_ON) in .github or agents-fail-on ($AGENTS_FAIL_ON) in the AI-agent / editor autorun files (exit $CODE_EXIT), see the code-scan output above"
+        exit 1
